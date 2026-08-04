@@ -58,7 +58,7 @@ def find_problem_dir(rootdir: Path, problem_name: Path) -> Optional[Path]:
 def compile(src: Path, rootdir: Path, opts: List[str] = []):
     if src.suffix == '.cpp':
         # use clang for msys2 clang environment
-        if os.name == 'nt' and sysconfig.get_platform().startswith('mingw') and sysconfig.get_platform().endswith('clang'):
+        if os.name == 'nt' and sysconfig.get_platform().startswith('mingw') and sysconfig.get_platform().endswith('llvm'):
             cxx = getenv('CXX', 'clang++')
         else:
             cxx = getenv('CXX', 'g++')
