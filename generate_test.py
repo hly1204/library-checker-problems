@@ -42,7 +42,23 @@ class TestGenerateAll(unittest.TestCase):
         with open(cache_path, 'w') as f:
             json.dump(versions, f)
         
+class TestGenerateAllDryRun(unittest.TestCase):
+    def test_generate_all(self):
+        tomls = list(filter(lambda p: not p.match('test/**/info.toml'), Path('.').glob('**/info.toml')))
+        tomls = sorted(tomls, key=lambda x: x.parent.name)
 
+        databases = []
+
+        for toml in tomls:
+            problem = Problem(Path.cwd(), toml.parent)
+            name = problem.basedir.name
+
+            with self.subTest(name=name):
+                logger.info('Generate {}'.format(name))
+                databases += problem.generate(mode=Problem.Mode.COMPILE_COMMANDS)
+
+        with open('compile_commands.json', 'w') as f:
+            json.dump(databases, f)
 
 def create_test_dir(problem_name: str) -> TemporaryDirectory:
     problem_dir = Path('test') / problem_name

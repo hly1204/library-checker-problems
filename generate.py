@@ -16,7 +16,7 @@ from difflib import unified_diff
 from subprocess import (PIPE, STDOUT, CalledProcessError,
                         TimeoutExpired, check_call, run)
 from tempfile import TemporaryDirectory
-from typing import Any, Iterator, List, MutableMapping, Optional, Union
+from typing import Any, Iterator, List, MutableMapping, Optional, Union, TypedDict
 
 from enum import Enum
 import toml
@@ -54,8 +54,12 @@ def find_problem_dir(rootdir: Path, problem_name: Path) -> Optional[Path]:
         return None
     return tomls[0].parent
 
+class JSONCompilationDatabase(TypedDict):
+    directory: str
+    arguments: List[str]
+    file: str
 
-def compile(src: Path, rootdir: Path, opts: List[str] = []):
+def compile(src: Path, rootdir: Path, opts: List[str] = [], dry_run: bool = False) -> Optional[JSONCompilationDatabase]:
     if src.suffix == '.cpp':
         # use clang for msys2 clang environment
         if os.name == 'nt' and sysconfig.get_platform().startswith('mingw') and sysconfig.get_platform().endswith('llvm'):
@@ -77,13 +81,20 @@ def compile(src: Path, rootdir: Path, opts: List[str] = []):
         cxxflags = getenv('CXXFLAGS', cxxflags_default).split()
         cxxflags.extend(['-I', str(rootdir / 'common')])
         args = [cxx] + cxxflags + \
-            ['-o', str(src.with_suffix(''))] + opts + [str(src)]
+            ['-o', str(src.with_suffix(''))] + opts + [str(src.absolute())]
         logger.debug('compile: %s', args)
-        check_call(args)
+        if not dry_run:
+            check_call(args)
+        database: JSONCompilationDatabase = {
+            "directory": str(rootdir),
+            "arguments": args,
+            "file": str(rootdir / src),
+        }
+        return database
     elif src.suffix == '.in':
-        pass
+        return None
     elif src.suffix == '.py':
-        pass
+        return None
     else:
         logger.error('Unknown type of file {}'.format(src))
         raise RuntimeError('Unknown type of file: {}'.format(src))
@@ -141,6 +152,7 @@ class Problem:
         DEV = 2
         TEST = 3
         CLEAN = 5
+        COMPILE_COMMANDS = 6
 
         def force_generate(self):
             return self == self.DEV or self == self.TEST
@@ -212,31 +224,39 @@ class Problem:
             for key, value in self.config.get('params', {}).items():
                 fh.write(param_to_str(key, value) + '\n')
 
-    def compile_correct(self):
+    def compile_correct(self, dry_run: bool = False) -> Optional[JSONCompilationDatabase]:
         logger.info('compile solution')
-        compile(self.basedir / 'sol' / 'correct.cpp', self.rootdir)
+        return compile(self.basedir / 'sol' / 'correct.cpp', self.rootdir, [], dry_run)
 
-    def compile_verifier(self):
+    def compile_verifier(self, dry_run: bool = False) -> Optional[JSONCompilationDatabase]:
         logger.info('compile verifier')
-        compile(self.verifier, self.rootdir)
+        return compile(self.verifier, self.rootdir, [], dry_run)
 
-    def compile_gens(self):
+    def compile_gens(self, dry_run: bool = False) -> List[JSONCompilationDatabase]:
         logger.info('compile generators')
+        databases = []
         for test in self.config['tests']:
             name = test['name']
             logger.info('compile {}'.format(name))
-            compile(self.basedir / 'gen' / name, self.rootdir)
+            database = compile(self.basedir / 'gen' / name, self.rootdir, [], dry_run)
+            if database is not None:
+                databases.append(database)
+        return databases
 
-    def compile_checker(self):
+    def compile_checker(self, dry_run: bool = False) -> Optional[JSONCompilationDatabase]:
         logger.info('compile checker')
-        compile(self.checker, self.rootdir)
+        return compile(self.checker, self.rootdir, [], dry_run)
 
-    def compile_solutions(self):
+    def compile_solutions(self, dry_run: bool = False) -> List[JSONCompilationDatabase]:
+        databases = []
         for sol in self.config.get('solutions', []):
             name = sol['name']
             opts = [str(self.basedir / 'grader' / 'grader.cpp'), '-I',
                     str(self.basedir / 'grader')] if sol.get('function', False) else []
-            compile(self.basedir / 'sol' / name, self.rootdir, opts)
+            database = compile(self.basedir / 'sol' / name, self.rootdir, opts, dry_run)
+            if database is not None:
+                databases.append(database)
+        return databases
 
     def check_all_solutions_used(self) -> bool:
         sol_names: set[str] = set()
@@ -506,7 +526,7 @@ class Problem:
         if (self.basedir / 'out').exists():
             shutil.rmtree(self.basedir / 'out')
 
-    def generate(self, mode: Mode):
+    def generate(self, mode: Mode) -> List[JSONCompilationDatabase]:
         if mode == self.Mode.DEV:
             self.ignore_warning = True
 
@@ -521,28 +541,51 @@ class Problem:
             logger.info('Cleaning input & output directory of {}'.format(
                 self.basedir.name))
             self.clean()
-            return
+            return []
+
+        if mode == self.Mode.COMPILE_COMMANDS:
+            databases = []
+            database = self.compile_checker(True)
+            if database is not None:
+                databases.append(database)
+            database = self.compile_correct(True)
+            if database is not None:
+                databases.append(database)
+            databases += self.compile_gens(True)
+            database = self.compile_verifier(True)
+            if database is not None:
+                databases.append(database)
+            databases += self.compile_solutions(True)
+            return databases
+
+        databases = []
 
         is_testcases_already_generated = self.is_testcases_already_generated()
         is_checker_already_generated = self.is_checker_already_generated()
 
         if not is_checker_already_generated or mode.force_generate():
-            self.compile_checker()
+            database = self.compile_checker()
+            if database is not None:
+                databases.append(database)
 
         if not is_testcases_already_generated or mode.force_generate():
-            self.compile_correct()
-            self.compile_gens()
+            database = self.compile_correct()
+            if database is not None:
+                databases.append(database)
+            databases += self.compile_gens()
             self.make_inputs()
 
         if mode.verify():
-            self.compile_verifier()
+            database = self.compile_verifier()
+            if database is not None:
+                databases.append(database)
             self.verify_inputs()
 
         if not is_testcases_already_generated or mode.force_generate():
             self.make_outputs(mode.verify())
 
         if mode.verify():
-            self.compile_solutions()
+            databases += self.compile_solutions()
             for sol in self.config.get('solutions', []):
                 self.judge(self.basedir / 'sol' / sol['name'], sol)
             if not self.check_all_solutions_used():
@@ -553,6 +596,7 @@ class Problem:
         else:
             self.assert_hashes()
 
+        return databases
 
 def main(args: List[str]):
     try:
